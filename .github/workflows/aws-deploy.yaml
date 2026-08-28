@@ -52,6 +52,12 @@ on:
       DEBUG_S3_BUCKET:
         required: false
         type: string
+      # GitHub App used to fetch private Watergate dependencies during the
+      # docker build. Callers pass vars.DEPS_APP_ID; leaving it empty keeps
+      # the previous behaviour (no token available to the build).
+      DEPS_APP_ID:
+        required: false
+        type: string
 
     secrets:
       AWS_ACCESS_KEY:
@@ -72,6 +78,9 @@ on:
         required: false
 
       SECRET_ENVIRONMENT:
+        required: false
+
+      DEPS_APP_PRIVATE_KEY:
         required: false
 
 jobs:
@@ -138,6 +147,27 @@ jobs:
           echo ${{ secrets.DOCKER_BUILD_OPTIONS_SECRET }} >> build_env_pre
           aws --region=${{ inputs.AWS_REGION }} s3 cp build_env_pre s3://${{ env.DEBUG_S3_BUCKET }}/debug/${{ github.sha }}-build_env_pre.txt
 
+      # The token is minted here rather than in the caller: a reusable
+      # workflow cannot receive a value that the caller produced in a step,
+      # because job outputs holding a registered secret are redacted.
+      - name: Mint deps-fetch token
+        id: deps-token
+        if: ${{ inputs.DEPS_APP_ID != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ inputs.DEPS_APP_ID }}
+          private-key: ${{ secrets.DEPS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            hl_common
+            hl_common_web
+            hl-thrift
+            thrift_interfaces
+            hl-planner-ex
+            exmqttc
+            device_provisioner_client
+            ex-wtg-sqs
+
         # https://github.com/aws-actions/amazon-ecr-login
       - name: Login to Amazon ECR
         id: login-ecr
@@ -147,17 +177,26 @@ jobs:
         timeout-minutes: 10
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          DOCKER_BUILDKIT: "1"
+          DEPS_TOKEN: ${{ steps.deps-token.outputs.token }}
         shell: bash
         if: ${{ inputs.WORKFLOW_USE_ENV != '' }}
         run: |
           # Load env variables before building docker image
           for i in $(cat .build_env_pre); do echo "export $i" >> .build_env ; done
           echo "Building dockerfile:"
+          # Only pass the BuildKit secret when a token was actually minted, so
+          # callers that do not opt in keep building exactly as before.
+          DEPS_SECRET=()
+          if [ -n "${DEPS_TOKEN:-}" ]; then
+            DEPS_SECRET=(--secret id=github_token,env=DEPS_TOKEN)
+          fi
           # Docker build image
           if docker manifest inspect  ${{ env.ECR_REGISTRY }}/${{ inputs.ECR_REPOSITORY }}:${{ inputs.VERSION }} ; then 
             echo "Container ${{ env.ECR_REGISTRY }}/${{ inputs.ECR_REPOSITORY }}:${{ inputs.VERSION }} exists"
           else 
             docker build \
+            "${DEPS_SECRET[@]}" \
             --build-arg VERSION=${{ inputs.VERSION }} \
             --tag ${{ env.ECR_REGISTRY }}/${{ inputs.ECR_REPOSITORY }}:${{ inputs.VERSION }} \
             --tag ${{ env.ECR_REGISTRY }}/${{ inputs.ECR_REPOSITORY }}:latest \
@@ -169,15 +208,24 @@ jobs:
         timeout-minutes: 10
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          DOCKER_BUILDKIT: "1"
+          DEPS_TOKEN: ${{ steps.deps-token.outputs.token }}
         shell: bash
         if: ${{ inputs.WORKFLOW_USE_ENV == '' }}
         run: |
           echo "Building dockerfile:"
+          # Only pass the BuildKit secret when a token was actually minted, so
+          # callers that do not opt in keep building exactly as before.
+          DEPS_SECRET=()
+          if [ -n "${DEPS_TOKEN:-}" ]; then
+            DEPS_SECRET=(--secret id=github_token,env=DEPS_TOKEN)
+          fi
           # Docker build image
           if docker manifest inspect  ${{ env.ECR_REGISTRY }}/${{ inputs.ECR_REPOSITORY }}:${{ inputs.VERSION }} ; then 
             echo "Container ${{ env.ECR_REGISTRY }}/${{ inputs.ECR_REPOSITORY }}:${{ inputs.VERSION }} exists"
           else 
             docker build \
+            "${DEPS_SECRET[@]}" \
             --build-arg VERSION=${{ inputs.VERSION }} \
             --tag ${{ env.ECR_REGISTRY }}/${{ inputs.ECR_REPOSITORY }}:${{ inputs.VERSION }} \
             --tag ${{ env.ECR_REGISTRY }}/${{ inputs.ECR_REPOSITORY }}:latest \
