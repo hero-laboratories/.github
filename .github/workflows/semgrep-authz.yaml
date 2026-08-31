@@ -62,9 +62,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    container:
-      # Pinned. `latest` would let a ruleset-engine change land without a PR.
-      image: semgrep/semgrep:1.174.0
+    env:
+      # Pinned. `latest` would let an engine change land without a PR.
+      #
+      # Semgrep runs as a `docker run` step rather than as the job's `container:`
+      # because the semgrep image is Alpine/musl. Hosted runners inject their own
+      # glibc Node into container jobs to run JavaScript actions, and
+      # actions/checkout and actions/upload-artifact are both JavaScript actions -
+      # so a `container:` job on this image puts the checkout at the mercy of
+      # whether the runner picks its musl Node build. Keeping the job on the host
+      # means the actions run natively and only semgrep runs in the container.
+      SEMGREP_IMAGE: semgrep/semgrep:1.174.0
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,8 +85,8 @@ jobs:
       # one.
       - name: Write ruleset
         run: |
-          mkdir -p /tmp/wg-semgrep
-          cat > /tmp/wg-semgrep/authz-fail-open.yml <<'RULES'
+          mkdir -p "$RUNNER_TEMP/wg-semgrep"
+          cat > "$RUNNER_TEMP/wg-semgrep/authz-fail-open.yml" <<'RULES'
           rules:
             # ----------------------------------------------------------------
             # 1. Ruby: an authorization predicate answers "allowed" from rescue.
@@ -191,12 +199,19 @@ jobs:
           # One scan, rendered twice: --metrics=off because this reads private
           # source and nothing should leave the runner; --error to exit non-zero
           # when a rule matches, so THIS step decides what that means.
-          semgrep scan \
-            --config /tmp/wg-semgrep/authz-fail-open.yml \
-            --metrics=off \
-            --error \
-            --json --output /tmp/wg-semgrep/findings.json \
-            $SCAN_PATHS
+          # Workspace read-only: a scanner has no business writing to the tree it
+          # is scanning. The rules/output directory is the only writable mount.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$RUNNER_TEMP/wg-semgrep:/wg" \
+            -w /src \
+            "$SEMGREP_IMAGE" \
+            semgrep scan \
+              --config /wg/authz-fail-open.yml \
+              --metrics=off \
+              --error \
+              --json --output /wg/findings.json \
+              $SCAN_PATHS
           rc=$?
 
           # Semgrep exits 1 for findings and >1 for its own failures. A crash or an
@@ -212,7 +227,7 @@ jobs:
           import json, os, sys
 
           rc, blocking = sys.argv[1], sys.argv[2] == "true"
-          results = json.load(open("/tmp/wg-semgrep/findings.json"))["results"]
+          results = json.load(open(os.environ["RUNNER_TEMP"] + "/wg-semgrep/findings.json"))["results"]
 
           lines = ["## Semgrep - authorization fail-open", "", f"Findings: **{len(results)}**", ""]
           for r in results:
@@ -250,6 +265,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: semgrep-authz-findings
-          path: /tmp/wg-semgrep/findings.json
+          path: ${{ runner.temp }}/wg-semgrep/findings.json
           retention-days: 14
           if-no-files-found: warn
